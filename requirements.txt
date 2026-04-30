@@ -1,0 +1,5 @@
+requests>=2.32
+rapidfuzz>=3.6
+tqdm>=4.66
+jsonschema>=4.21
+python-dotenv>=1.0

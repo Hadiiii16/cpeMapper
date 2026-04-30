@@ -1,0 +1,25 @@
+# secrets
+.env
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# data caches (large / runtime-only)
+data/nvd_cpe.sqlite
+data/nvd_cpe.checkpoint.json
+data/run_cache.sqlite
+data/run_cache.sqlite-shm
+data/run_cache.sqlite-wal
+
+# logs
+*.log
+
+# generated output (user re-runs to produce)
+EMBA_cyclonedx_sbom.enriched.json
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
