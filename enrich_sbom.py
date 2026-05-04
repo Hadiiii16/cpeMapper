@@ -38,7 +38,8 @@ from pre_filter import (
     _component_from_sbom_entry,
     find_candidates,
 )
-from gemini_rank import DEFAULT_MODEL, Ranked, rank_with_gemini
+from gemini_rank import DEFAULT_MODEL as GEMINI_DEFAULT_MODEL, Ranked, rank_with_gemini
+from codex_rank import DEFAULT_MODEL as CODEX_DEFAULT_MODEL, rank_with_codex
 
 
 CACHE_SCHEMA = """
@@ -139,13 +140,15 @@ def process_one(
     top: int,
     model: str,
     timeout: int,
+    backend: str = "gemini",
 ) -> dict:
     """Returns a dict with keys: bom_ref, name, status, ranked (list of Ranked dicts), meta."""
     comp = _component_from_sbom_entry(entry)
     bom_ref = comp.bom_ref or comp.name
 
     _, candidates = find_candidates(nvd_conn, comp, top_n=top)
-    in_hash = _input_hash(comp, candidates, model)
+    # Cache key includes backend so switching backends doesn't reuse old answers.
+    in_hash = _input_hash(comp, candidates, f"{backend}:{model}")
 
     cached = cache_lookup(cache_conn, bom_ref, in_hash)
     if cached:
@@ -158,9 +161,12 @@ def process_one(
             meta = {"source": "no_candidates", "model": model, "fallback": True, "elapsed_sec": 0.0}
             status = "no_candidates"
         else:
-            ranked, meta = rank_with_gemini(comp, candidates, model=model, timeout=timeout)
+            if backend == "codex":
+                ranked, meta = rank_with_codex(comp, candidates, model=model, timeout=timeout)
+            else:
+                ranked, meta = rank_with_gemini(comp, candidates, model=model, timeout=timeout)
             status = meta.get("source", "unknown")
-        cache_store(cache_conn, bom_ref, in_hash, ranked, meta, model)
+        cache_store(cache_conn, bom_ref, in_hash, ranked, meta, f"{backend}:{model}")
 
     return {
         "bom_ref": bom_ref,
@@ -221,6 +227,7 @@ def run(
     limit: int | None,
     name_filter: str | None,
     log_path: Path,
+    backend: str = "gemini",
 ) -> None:
     if not nvd_db.exists():
         print(f"NVD CPE DB not found at {nvd_db}. Run download_nvd_cpe.py first.", file=sys.stderr)
@@ -231,8 +238,8 @@ def run(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
-    logging.info("starting enrich; sbom=%s output=%s top=%d model=%s concurrency=%d",
-                 sbom_path, output_path, top, model, concurrency)
+    logging.info("starting enrich; sbom=%s output=%s top=%d backend=%s model=%s concurrency=%d",
+                 sbom_path, output_path, top, backend, model, concurrency)
 
     sbom = json.loads(sbom_path.read_text())
     components = sbom.get("components", [])
@@ -264,7 +271,7 @@ def run(
                 break
             try:
                 r = process_one(entry, nvd_conn, cache_conn,
-                                top=top, model=model, timeout=timeout)
+                                top=top, model=model, timeout=timeout, backend=backend)
                 results_by_ref[r["bom_ref"]] = r
                 logging.info("ok bom_ref=%s status=%s cands=%d",
                              r["bom_ref"], r["status"], r["candidate_count"])
@@ -277,7 +284,7 @@ def run(
         with cf.ThreadPoolExecutor(max_workers=concurrency) as pool:
             futures = {
                 pool.submit(process_one, entry, nvd_conn, cache_conn,
-                            top=top, model=model, timeout=timeout): entry
+                            top=top, model=model, timeout=timeout, backend=backend): entry
                 for entry in components_to_process
             }
             for fut in cf.as_completed(futures):
@@ -351,8 +358,11 @@ def main() -> None:
     p.add_argument("--output", default="EMBA_cyclonedx_sbom.enriched.json")
     p.add_argument("--nvd-db", default="data/nvd_cpe.sqlite")
     p.add_argument("--cache-db", default="data/run_cache.sqlite")
-    p.add_argument("--top", type=int, default=50, help="candidates passed to Gemini")
-    p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument("--top", type=int, default=50, help="candidates passed to the ranker")
+    p.add_argument("--backend", choices=["gemini", "codex"], default="gemini",
+                   help="LLM backend: 'gemini' (HTTP) or 'codex' (Codex CLI subprocess)")
+    p.add_argument("--model", default=None,
+                   help="override model; defaults: gemini=$GEMINI_MODEL, codex=$CODEX_MODEL")
     p.add_argument("--concurrency", type=int, default=3)
     p.add_argument("--timeout", type=int, default=120)
     p.add_argument("--limit", type=int, default=None, help="process only the first N components")
@@ -368,18 +378,23 @@ def main() -> None:
         cmd_validate(Path(args.output))
         return
 
+    model = args.model
+    if model is None:
+        model = CODEX_DEFAULT_MODEL if args.backend == "codex" else GEMINI_DEFAULT_MODEL
+
     run(
         sbom_path=Path(args.input),
         output_path=Path(args.output),
         nvd_db=Path(args.nvd_db),
         cache_db=Path(args.cache_db),
         top=args.top,
-        model=args.model,
+        model=model,
         concurrency=args.concurrency,
         timeout=args.timeout,
         limit=args.limit,
         name_filter=args.name,
         log_path=Path(args.log),
+        backend=args.backend,
     )
 
 
