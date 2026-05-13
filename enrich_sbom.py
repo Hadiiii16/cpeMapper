@@ -42,6 +42,47 @@ from gemini_rank import DEFAULT_MODEL as GEMINI_DEFAULT_MODEL, Ranked, rank_with
 from codex_rank import DEFAULT_MODEL as CODEX_DEFAULT_MODEL, rank_with_codex
 
 
+# ---------- deterministic ranker -----------------------------------------------------------
+
+def rank_deterministic(comp: Component, candidates: list[Candidate]) -> tuple[list[Ranked], dict]:
+    """Pick the Top-10 directly from pre_filter scores.
+
+    No LLM call. Score components are already baked into Candidate.score:
+        retrieval pass base + version bonus * deprecation penalty + CVE attribution bonus.
+
+    The caller assumes `candidates` is already sorted by score descending
+    (find_candidates -> select_topn does this).
+
+    Score normalization for the public Ranked.score: a Top-50 candidate's raw
+    score lives in roughly [0, 14] (Pass 1 base 3 + version exact 5 + CVE bonus 3
+    + a few minor signals). We map to [0, 1] with a soft compression so 0.85+
+    correlates with "exact version + canonical (vendor, product) + ≥10 CVEs".
+    """
+    if not candidates:
+        return (
+            [Ranked(cpe="", score=0.0, rationale="no candidates") for _ in range(10)],
+            {"source": "no_candidates", "model": "deterministic", "elapsed_sec": 0.0, "fallback": False,
+             "top_raw_score": 0.0},
+        )
+
+    raw_max = 12.0  # rough upper bound; clamp+normalize below
+    ranked: list[Ranked] = []
+    for c in candidates[:10]:
+        norm = max(0.0, min(1.0, c.score / raw_max))
+        rationale = c.rationale or f"pass {c.pass_id} retrieval"
+        ranked.append(Ranked(cpe=c.cpe_name, score=round(norm, 3), rationale=rationale[:120]))
+    while len(ranked) < 10:
+        ranked.append(Ranked(cpe="", score=0.0, rationale="no good match"))
+    return ranked, {
+        "source": "deterministic",
+        "model": "deterministic",
+        "elapsed_sec": 0.0,
+        "fallback": False,
+        "candidates_considered": len(candidates),
+        "top_raw_score": round(candidates[0].score, 3) if candidates else 0.0,
+    }
+
+
 CACHE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS results (
     bom_ref     TEXT NOT NULL,
@@ -58,9 +99,24 @@ CREATE TABLE IF NOT EXISTS results (
 # implicit-BEGIN inserts otherwise raise "cannot start a transaction within a transaction".
 _CACHE_LOCK = threading.Lock()
 
-CANDIDATE_SOURCE_KEY = "EMBA:cpe_candidates:source"
-CANDIDATE_STATUS_KEY = "EMBA:cpe_candidates:status"
+UPSTREAM_PREFIX = "EMBA:cpe_upstream:"
+UPSTREAM_CPE_KEY       = f"{UPSTREAM_PREFIX}cpe"
+UPSTREAM_SCORE_KEY     = f"{UPSTREAM_PREFIX}score"
+UPSTREAM_STATUS_KEY    = f"{UPSTREAM_PREFIX}status"
+UPSTREAM_SOURCE_KEY    = f"{UPSTREAM_PREFIX}source"
+UPSTREAM_RATIONALE_KEY = f"{UPSTREAM_PREFIX}rationale"
+
+# Legacy Top-10 candidates prefix retained only to strip old annotations on re-run.
 CANDIDATE_PREFIX = "EMBA:cpe_candidates:"
+
+# Raw-score cutoff below which Top-1 is marked low_confidence. 8.0 corresponds
+# roughly to "exact (vendor, product) + EXACT version + at least one CVE
+# attribution" — i.e. the minimum for trusting Top-1 without human review.
+# Empirically this filters out substring/version-coincidence false positives
+# (e.g. alsa-lib -> libpng:libpng:1.0.28, breakpad-wrapper -> jenkins:vboxwrapper)
+# while keeping all known-correct upstream picks (busybox, openssl, dropbear,
+# gnutls, dnsmasq) safely above the threshold.
+LOW_CONFIDENCE_RAW = 8.0
 
 
 # ---------- cache ---------------------------------------------------------------------------
@@ -161,7 +217,9 @@ def process_one(
             meta = {"source": "no_candidates", "model": model, "fallback": True, "elapsed_sec": 0.0}
             status = "no_candidates"
         else:
-            if backend == "codex":
+            if backend == "deterministic":
+                ranked, meta = rank_deterministic(comp, candidates)
+            elif backend == "codex":
                 ranked, meta = rank_with_codex(comp, candidates, model=model, timeout=timeout)
             else:
                 ranked, meta = rank_with_gemini(comp, candidates, model=model, timeout=timeout)
@@ -180,34 +238,100 @@ def process_one(
 
 # ---------- annotation ----------------------------------------------------------------------
 
-def _strip_old_candidate_props(props: list[dict]) -> list[dict]:
-    return [p for p in props if not (isinstance(p, dict) and (p.get("name") or "").startswith(CANDIDATE_PREFIX))]
+def _strip_old_props(props: list[dict]) -> list[dict]:
+    """Remove any prior EMBA annotations and the matching syft:cpe23 property we own.
+
+    We strip exactly the syft:cpe23 entry whose value equals the previously stored
+    EMBA:cpe_upstream:cpe, so re-runs replace our annotation without disturbing
+    any other syft:cpe23 entries (e.g. ones Syft itself may have produced).
+    """
+    prior_upstream_cpe = next(
+        (p.get("value") for p in props
+         if isinstance(p, dict) and p.get("name") == UPSTREAM_CPE_KEY),
+        "",
+    )
+    keep: list[dict] = []
+    for p in props:
+        if not isinstance(p, dict):
+            keep.append(p)
+            continue
+        name = p.get("name") or ""
+        if name.startswith(CANDIDATE_PREFIX) or name.startswith(UPSTREAM_PREFIX):
+            continue
+        if name == "syft:cpe23" and prior_upstream_cpe and p.get("value") == prior_upstream_cpe:
+            continue
+        keep.append(p)
+    return keep
 
 
 def annotate_entry(entry: dict, ranked: list[dict], status: str, meta: dict) -> None:
+    """Attach a single upstream-CPE annotation derived from Top-1 of `ranked`.
+
+    Reads:
+      * ranked[0] — the highest-scoring candidate (or empty cpe if none)
+      * meta["top_raw_score"] — pre-normalization score used to decide low_confidence
+      * meta["model"], meta["source"] — for provenance
+
+    Writes (preserves the original `cpe` field on the component):
+      EMBA:cpe_upstream:cpe        canonical CPE pick
+      EMBA:cpe_upstream:score      normalized [0..1]
+      EMBA:cpe_upstream:status     deterministic | low_confidence | no_candidates
+      EMBA:cpe_upstream:source     "<model>@<date> via <source>"
+      EMBA:cpe_upstream:rationale  score reasoning text (<=120 chars)
+    """
     props = entry.get("properties")
     if not isinstance(props, list):
         props = []
-    props = _strip_old_candidate_props(props)
+    props = _strip_old_props(props)
+
+    top = ranked[0] if ranked else {"cpe": "", "score": 0.0, "rationale": ""}
+    cpe = top.get("cpe", "") or ""
+    try:
+        score = float(top.get("score", 0.0))
+    except (TypeError, ValueError):
+        score = 0.0
+    rationale = (top.get("rationale", "") or "")[:120]
+    raw_score = float(meta.get("top_raw_score", 0.0) or 0.0)
+
+    # Promote status to low_confidence when raw_score is below the cutoff and we
+    # did produce a CPE. no_candidates / fallback statuses pass through unchanged.
+    final_status = status
+    if status == "deterministic" and cpe and raw_score < LOW_CONFIDENCE_RAW:
+        final_status = "low_confidence"
 
     src_label = (
         f"{meta.get('model', '')}@{datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
         f" via {meta.get('source', 'unknown')}"
     )
-    props.append({"name": CANDIDATE_SOURCE_KEY, "value": src_label})
-    props.append({"name": CANDIDATE_STATUS_KEY, "value": status})
 
-    for i, r in enumerate(ranked, 1):
-        cpe = r.get("cpe", "")
-        if not cpe:
-            # still record the slot so downstream can see we tried 10 ranks
-            props.append({"name": f"{CANDIDATE_PREFIX}{i}:cpe", "value": ""})
-            props.append({"name": f"{CANDIDATE_PREFIX}{i}:score", "value": "0"})
-            props.append({"name": f"{CANDIDATE_PREFIX}{i}:rationale", "value": r.get("rationale", "")[:120]})
-            continue
-        props.append({"name": f"{CANDIDATE_PREFIX}{i}:cpe", "value": cpe})
-        props.append({"name": f"{CANDIDATE_PREFIX}{i}:score", "value": f"{float(r.get('score', 0)):.3f}"})
-        props.append({"name": f"{CANDIDATE_PREFIX}{i}:rationale", "value": (r.get("rationale", "") or "")[:120]})
+    props.append({"name": UPSTREAM_CPE_KEY,       "value": cpe})
+    props.append({"name": UPSTREAM_SCORE_KEY,     "value": f"{score:.3f}"})
+    props.append({"name": UPSTREAM_STATUS_KEY,    "value": final_status})
+    props.append({"name": UPSTREAM_SOURCE_KEY,    "value": src_label})
+    props.append({"name": UPSTREAM_RATIONALE_KEY, "value": rationale})
+
+    # Mirror the canonical CPE into Syft's convention. Grype's CycloneDX adapter
+    # reads syft:cpe23 properties and includes them in its CPE matcher set when
+    # the SBOM is produced by Syft (see metadata.tools registration in run()).
+    #
+    # Emission rules:
+    #   1. status must be "deterministic" — low_confidence picks are too often
+    #      wrong (e.g. kmod-* -> qualcomm/libmikmod/oracle) and would inflate
+    #      grype with vendor-wide CVE noise.
+    #   2. cpe must differ from the existing component cpe (avoid dup).
+    #   3. The component must not be a kernel module package (kmod-*). On OpenWrt
+    #      every kernel module ships as a separate package, but they all share
+    #      the same linux:linux_kernel CPE. Emitting that CPE on every one
+    #      causes the kernel's full CVE set to be duplicated across dozens of
+    #      "components" downstream. The main 'kernel' component carries the
+    #      kernel CPE; modules ride along with it.
+    name = (entry.get("name") or "").lower()
+    is_kernel_module = name.startswith("kmod-")
+    if (final_status == "deterministic"
+            and cpe
+            and cpe != (entry.get("cpe") or "")
+            and not is_kernel_module):
+        props.append({"name": "syft:cpe23", "value": cpe})
 
     entry["properties"] = props
 
@@ -313,6 +437,11 @@ def run(
             continue  # not processed in this run; leave as-is
         annotate_entry(entry, r["ranked"], r["status"], r["meta"])
 
+    # Register Syft as a producing tool. Grype's CycloneDX adapter routes the
+    # parse through its Syft decoder when this is present, which is the path
+    # that reads the syft:cpe23 properties we wrote during annotation.
+    _ensure_syft_metadata_tool(sbom)
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(sbom, ensure_ascii=False, indent=2))
 
@@ -323,33 +452,95 @@ def run(
             print("   -", f)
 
 
+def _ensure_syft_metadata_tool(sbom: dict) -> None:
+    """Ensure metadata.tools lists Syft so grype routes through its Syft adapter.
+
+    CycloneDX 1.5 allows tools as either an array (older shape) or an object
+    with `components`/`services` arrays (newer shape). We handle both.
+    """
+    entry_legacy = {"vendor": "anchore", "name": "syft", "version": "cpe-mapper"}
+    entry_modern = {"type": "application", "author": "anchore", "name": "syft", "version": "cpe-mapper"}
+    md = sbom.setdefault("metadata", {})
+    tools = md.get("tools")
+    if isinstance(tools, list):
+        if not any(isinstance(t, dict) and t.get("name") == "syft" for t in tools):
+            tools.append(entry_legacy)
+    elif isinstance(tools, dict):
+        comps = tools.setdefault("components", [])
+        if not any(isinstance(t, dict) and t.get("name") == "syft" for t in comps):
+            comps.append(entry_modern)
+    else:
+        md["tools"] = [entry_legacy]
+
+
+def cmd_reannotate(input_path: Path, output_path: Path, cache_db: Path, backend: str) -> None:
+    """Fast path: re-emit annotations from cached results without running pre_filter.
+
+    Use when only the annotation schema or the LOW_CONFIDENCE_RAW threshold has
+    changed and the underlying (component -> candidates -> ranked) work in the
+    cache is still valid. Skips the 1-2s/component SQL+rapidfuzz work that
+    `run()` does even on cache hits.
+    """
+    if not cache_db.exists():
+        raise SystemExit(f"cache DB not found: {cache_db}")
+    sbom = json.loads(input_path.read_text())
+    cache = sqlite3.connect(cache_db)
+
+    annotated = 0
+    skipped = 0
+    for entry in sbom.get("components", []):
+        ref = entry.get("bom-ref") or entry.get("name")
+        if not ref:
+            skipped += 1
+            continue
+        row = cache.execute(
+            "SELECT result_json, meta_json FROM results "
+            "WHERE bom_ref=? AND model LIKE ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (ref, f"{backend}:%"),
+        ).fetchone()
+        if not row:
+            skipped += 1
+            continue
+        ranked = json.loads(row[0])
+        meta = json.loads(row[1])
+        status = meta.get("source", "unknown")
+        annotate_entry(entry, ranked, status, meta)
+        annotated += 1
+    cache.close()
+
+    _ensure_syft_metadata_tool(sbom)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(sbom, ensure_ascii=False, indent=2))
+    print(f"reannotated {annotated} components; skipped {skipped}; wrote {output_path}")
+
+
 def cmd_validate(output_path: Path) -> None:
     sbom = json.loads(output_path.read_text())
     comps = sbom.get("components", [])
     total = len(comps)
     annotated = 0
-    bad = []
+    status_counts: dict[str, int] = {}
+    bad: list = []
     for c in comps:
         props = c.get("properties") or []
-        names = {p.get("name") for p in props if isinstance(p, dict)}
-        if any(n and n.startswith(CANDIDATE_PREFIX) for n in names):
+        prop_map = {p.get("name"): p.get("value") for p in props if isinstance(p, dict)}
+        if UPSTREAM_STATUS_KEY in prop_map:
             annotated += 1
-        # Sanity-check candidate cpe values
-        for p in props:
-            if not isinstance(p, dict):
-                continue
-            n = p.get("name", "")
-            if n.endswith(":cpe") and n.startswith(CANDIDATE_PREFIX):
-                v = p.get("value", "")
-                if v and not v.startswith("cpe:2.3:"):
-                    bad.append((c.get("name"), n, v))
-    print(f"components: {total}")
-    print(f"annotated : {annotated}")
-    print(f"bad cpe values: {len(bad)}")
+            status_counts[prop_map[UPSTREAM_STATUS_KEY]] = status_counts.get(prop_map[UPSTREAM_STATUS_KEY], 0) + 1
+        cpe = prop_map.get(UPSTREAM_CPE_KEY, "")
+        if cpe and not cpe.startswith("cpe:2.3:"):
+            bad.append((c.get("name"), UPSTREAM_CPE_KEY, cpe))
+    print(f"components       : {total}")
+    print(f"annotated        : {annotated}")
+    print(f"status histogram :")
+    for k, n in sorted(status_counts.items(), key=lambda x: -x[1]):
+        print(f"  {k:18s} {n}")
+    print(f"bad cpe values   : {len(bad)}")
     for b in bad[:10]:
         print("  ", b)
     if total != annotated:
-        print(f"  WARN: {total - annotated} components without candidate annotations")
+        print(f"  WARN: {total - annotated} components without upstream annotations")
 
 
 def main() -> None:
@@ -359,10 +550,11 @@ def main() -> None:
     p.add_argument("--nvd-db", default="data/nvd_cpe.sqlite")
     p.add_argument("--cache-db", default="data/run_cache.sqlite")
     p.add_argument("--top", type=int, default=50, help="candidates passed to the ranker")
-    p.add_argument("--backend", choices=["gemini", "codex"], default="gemini",
-                   help="LLM backend: 'gemini' (HTTP) or 'codex' (Codex CLI subprocess)")
+    p.add_argument("--backend", choices=["deterministic", "gemini", "codex"], default="deterministic",
+                   help="ranking backend: 'deterministic' (no LLM, scores from pre_filter + CVE attribution) "
+                        "or 'gemini'/'codex' (LLM-ranked)")
     p.add_argument("--model", default=None,
-                   help="override model; defaults: gemini=$GEMINI_MODEL, codex=$CODEX_MODEL")
+                   help="override model (gemini/codex backends only); defaults: gemini=$GEMINI_MODEL, codex=$CODEX_MODEL")
     p.add_argument("--concurrency", type=int, default=3)
     p.add_argument("--timeout", type=int, default=120)
     p.add_argument("--limit", type=int, default=None, help="process only the first N components")
@@ -370,6 +562,8 @@ def main() -> None:
     p.add_argument("--log", default="run.log")
     p.add_argument("--validate", action="store_true",
                    help="validate an already-enriched output file and exit")
+    p.add_argument("--reannotate", action="store_true",
+                   help="rebuild annotations from cached results (skip pre_filter / LLM)")
     args = p.parse_args()
 
     load_dotenv()
@@ -378,9 +572,18 @@ def main() -> None:
         cmd_validate(Path(args.output))
         return
 
+    if args.reannotate:
+        cmd_reannotate(Path(args.input), Path(args.output), Path(args.cache_db), args.backend)
+        return
+
     model = args.model
     if model is None:
-        model = CODEX_DEFAULT_MODEL if args.backend == "codex" else GEMINI_DEFAULT_MODEL
+        if args.backend == "codex":
+            model = CODEX_DEFAULT_MODEL
+        elif args.backend == "gemini":
+            model = GEMINI_DEFAULT_MODEL
+        else:
+            model = "deterministic"
 
     run(
         sbom_path=Path(args.input),

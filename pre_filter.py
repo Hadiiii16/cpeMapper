@@ -5,14 +5,19 @@ Strategy is a 3-pass funnel:
     Pass 2 (product): rows whose product matches any product-token (= or LIKE)
     Pass 3 (fuzzy)  : rapidfuzz score over the unioned pool against a synthetic query string
 
-Anything Gemini would consider lives in this output set, so we err toward recall and
-let Gemini do the precision work.
+When data/nvd_cve_attribution.sqlite is present (built by download_nvd_cves.py),
+candidates additionally receive a CVE-attribution bonus: pairs (vendor, product)
+that NVD actually indexes against in real CVE configurations rank above
+dictionary-only orphan entries. This lets find_candidates produce a
+deterministic Top-N without needing an LLM to disambiguate vendor variants.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import re
 import sqlite3
 from dataclasses import dataclass, field
@@ -346,6 +351,20 @@ def pass1_exact(conn: sqlite3.Connection, q: Query, limit: int = 5000) -> list[C
     return [_row_to_candidate(r, pass_id=1, base_score=3.0, rationale="exact vendor/product") for r in rows]
 
 
+PASS2_MIN_TOKEN_LEN = 4
+# Generic tokens that match across many unrelated products and dilute Pass 2's
+# precision. Each appears as a fragment in 100+ unrelated NVD products
+# (verified empirically). Pass 2 skips these even when the SBOM name produces
+# them; if the actual canonical product genuinely equals one of these strings
+# (rare), Pass 1's exact-match path still catches it.
+PASS2_STOPWORDS = frozenset({
+    "lib", "libs", "utils", "tools", "tool", "core", "common", "module",
+    "modules", "kmod", "kernel", "linux", "mod", "bin", "src", "test",
+    "tests", "dev", "doc", "docs", "data", "fw", "firmware", "driver",
+    "drivers", "service", "services", "config", "scripts",
+})
+
+
 def pass2_product(conn: sqlite3.Connection, q: Query, limit: int = 4000) -> list[Candidate]:
     if not q.products:
         return []
@@ -353,6 +372,12 @@ def pass2_product(conn: sqlite3.Connection, q: Query, limit: int = 4000) -> list
     seen: set[str] = set()
     for p in q.products:
         if not p:
+            continue
+        # Skip overly generic short tokens. They dominate NVD substring matches
+        # against unrelated products (e.g. 'pm' -> phpmyfaq, 'tc' -> nextcloud,
+        # 'lib' -> libpng). Pass 1 still catches the canonical pair via exact
+        # match; Pass 3 fuzzy still considers anything in the union pool.
+        if len(p) < PASS2_MIN_TOKEN_LEN or p.lower() in PASS2_STOPWORDS:
             continue
         rows = conn.execute(
             f"SELECT {_select_columns()} FROM cpe "
@@ -461,6 +486,139 @@ def apply_deprecation_penalty(pool: list[Candidate]) -> None:
             c.score *= 0.85
 
 
+# ---------- CVE attribution bonus ----------------------------------------------------------
+
+DEFAULT_CVE_DB_PATH = Path(os.environ.get("CVE_ATTRIBUTION_DB", "data/nvd_cve_attribution.sqlite"))
+
+# Cache: lazy-loaded once per process.
+_cve_attribution: dict[tuple[str, str], int] | None = None
+
+
+def load_cve_attribution(db_path: Path = DEFAULT_CVE_DB_PATH) -> dict[tuple[str, str], int]:
+    """Load (vendor, product) -> cve_count map from the attribution DB.
+
+    Returns an empty dict if the DB file is missing — pre_filter then degrades
+    gracefully to retrieval-only scoring.
+    """
+    global _cve_attribution
+    if _cve_attribution is not None:
+        return _cve_attribution
+    if not db_path.exists():
+        _cve_attribution = {}
+        return _cve_attribution
+    out: dict[tuple[str, str], int] = {}
+    conn = sqlite3.connect(db_path)
+    try:
+        for vendor, product, n in conn.execute("SELECT vendor, product, cve_count FROM cve_attribution"):
+            out[(vendor, product)] = int(n)
+    finally:
+        conn.close()
+    _cve_attribution = out
+    return out
+
+
+def _cve_bonus(count: int) -> tuple[float, str]:
+    """Map raw CVE attribution count to a score bonus and a one-line label.
+
+    The bonus is asymmetric on purpose:
+
+      * count == 0 -> -2.0     "NVD has never indexed this CPE in any CVE
+                                 configuration." Strong evidence the entry is
+                                 a dictionary alias / orphan and querying it
+                                 returns nothing.
+      * count 1-2  ->  0.0     Could be a brand-new product or a real but
+                                 rarely-cited CPE; insufficient evidence either
+                                 way, so neutral.
+      * count >= 3 -> +log10(count) clamped to [+1.0, +3.0]
+                                 Live CPE that NVD indexes vulnerabilities
+                                 against. Logarithmic so a product with 1000
+                                 CVEs doesn't bury one with 50.
+    """
+    if count == 0:
+        return -2.0, "0 CVE attributions (likely orphan)"
+    if count <= 2:
+        return 0.0, f"{count} CVE attribution(s) (sparse)"
+    bonus = max(1.0, min(3.0, math.log10(max(count, 10))))
+    return bonus, f"{count} CVE attributions"
+
+
+def apply_cve_attribution_bonus(
+    pool: list[Candidate],
+    attribution: dict[tuple[str, str], int] | None = None,
+) -> None:
+    if attribution is None:
+        attribution = load_cve_attribution()
+    if not attribution:
+        return  # DB missing — leave scores untouched.
+    for c in pool:
+        n = attribution.get((c.vendor, c.product), 0)
+        bonus, label = _cve_bonus(n)
+        if bonus == 0.0:
+            continue
+        c.score += bonus
+        # Append to rationale so downstream callers can trace why a candidate ranked.
+        c.rationale = f"{c.rationale}; {label}" if c.rationale else label
+
+
+# ---------- Cross-domain penalty ----------------------------------------------------------
+
+# SBOM components whose `group` (or purl scheme) signals "firmware / embedded"
+# context. When set, web-platform CPEs (WordPress plugins etc.) are penalized
+# because matching on coincidental product names across domains is the dominant
+# false-positive pattern in this corpus.
+EMBEDDED_GROUP_MARKERS = ("OpenWRT", "openwrt", "linux_kernel+module")
+EMBEDDED_PURL_TOKENS   = (":opkg/", "pkg:openwrt")
+
+# CPE strings carry target software in field 10 (e.g. `:wordpress:`,
+# `:drupal:`). We also scan the title for legible markers.
+WEB_PLATFORM_CPE_TOKENS = (
+    ":wordpress:", ":drupal:", ":joomla:", ":magento:", ":prestashop:",
+    ":shopify:", ":typo3:", ":mediawiki:", ":moodle:",
+)
+WEB_PLATFORM_TITLE_TOKENS = (
+    "wordpress plugin", "wordpress theme",
+    "drupal module", "drupal theme",
+    "joomla extension", "joomla! extension", "joomla component",
+    "magento extension", "prestashop module",
+)
+CROSS_DOMAIN_PENALTY = -5.0
+
+
+def _is_embedded_context(comp: Component) -> bool:
+    if comp.group and comp.group in EMBEDDED_GROUP_MARKERS:
+        return True
+    if comp.purl and any(t in comp.purl for t in EMBEDDED_PURL_TOKENS):
+        return True
+    return False
+
+
+def _is_web_platform_cpe(c: Candidate) -> bool:
+    name = (c.cpe_name or "").lower()
+    if any(t in name for t in WEB_PLATFORM_CPE_TOKENS):
+        return True
+    title = (c.title or "").lower()
+    if any(t in title for t in WEB_PLATFORM_TITLE_TOKENS):
+        return True
+    return False
+
+
+def apply_cross_domain_penalty(pool: list[Candidate], comp: Component) -> None:
+    """Penalize web-platform CPEs when the SBOM component is firmware/embedded.
+
+    Without this, an OpenWrt utility named `bridge` collides with a WordPress
+    plugin named `bridge`; both share product='bridge' so Pass 1 hits and
+    version match boost the wrong one. Domain mismatch is a strong negative
+    signal we can detect from cpe target_sw / title.
+    """
+    if not _is_embedded_context(comp):
+        return
+    for c in pool:
+        if _is_web_platform_cpe(c):
+            c.score += CROSS_DOMAIN_PENALTY
+            label = "cross-domain (web platform)"
+            c.rationale = f"{c.rationale}; {label}" if c.rationale else label
+
+
 def select_topn(pool: list[Candidate], n: int = 50) -> list[Candidate]:
     # dedupe by cpe_name keeping highest score
     best: dict[str, Candidate] = {}
@@ -483,6 +641,8 @@ def find_candidates(conn: sqlite3.Connection, comp: Component, top_n: int = 50) 
     pool = pass3_fuzzy(conn, q, pool)
     apply_version_bonus(pool, q)
     apply_deprecation_penalty(pool)
+    apply_cve_attribution_bonus(pool)
+    apply_cross_domain_penalty(pool, comp)
     return q, select_topn(pool, top_n)
 
 
